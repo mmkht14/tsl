@@ -509,16 +509,36 @@ void AggregateXPlane(const XPlane& full_trace, XPlane& aggregated_trace) {
     int64_t children_duration;
   };
   using StatByEvent = absl::flat_hash_map<int64_t /*event_id*/, EventStat>;
+  using StatByGroup = absl::flat_hash_map<int64_t /*group_id*/, StatByEvent>;
 
-  absl::flat_hash_map<int64_t /*line_id*/, StatByEvent> stats;
+  absl::flat_hash_map<int64_t /*line_id*/, StatByGroup> stats;
 
-  XPlaneVisitor plane(&full_trace);
+  const XPlaneVisitor& plane = CreateTfXPlaneVisitor(&full_trace);
   XPlaneBuilder aggregated_plane(&aggregated_trace);
 
   uint64_t first_op_start_ps = kint64max;
   uint64_t last_op_end_ps = 0;
 
   plane.ForEachLine([&](const XLineVisitor& line) {
+    if (line.Name() == kStepLineName) {
+      XLineBuilder aggregated_line =
+          aggregated_plane.GetOrCreateLine(line.Id());
+      aggregated_line.SetName(kStepLineName);
+      line.ForEachEvent([&](const XEventVisitor& event) {
+        XEventMetadata* dst_event_metadata =
+            aggregated_plane.GetOrCreateEventMetadata(event.Id());
+        CopyEventMetadata(*plane.GetEventMetadata(event.Id()), plane,
+                          *dst_event_metadata, aggregated_plane);
+        auto dst_event = aggregated_line.AddEvent(*dst_event_metadata);
+        dst_event.SetDurationNs(event.DurationNs());
+        dst_event.SetOffsetNs(event.OffsetNs());
+        event.ForEachStat([&](const XStatVisitor& stat) {
+          XStatMetadata& metadata =
+              *aggregated_plane.GetOrCreateStatMetadata(stat.Name());
+          dst_event.AddStat(metadata, stat.RawStat(), full_trace);
+        });
+      });
+    }
     if (!IsOpLineName(line.Name())) return;
     XLineBuilder aggregated_line = aggregated_plane.GetOrCreateLine(line.Id());
     aggregated_line.SetName(line.Name());
@@ -530,8 +550,11 @@ void AggregateXPlane(const XPlane& full_trace, XPlane& aggregated_trace) {
       last_op_end_ps = last_op_end_ps >= event.EndTimestampPs()
                            ? last_op_end_ps
                            : event.EndTimestampPs();
+      const auto& group_stat = event.GetStat(StatType::kGroupId);
+      int64_t group_id =
+          group_stat.has_value() ? group_stat->IntOrUintValue() : 0;
 
-      StatByEvent& line_stats = stats[line.Id()];
+      StatByEvent& line_stats = stats[line.Id()][group_id];
       line_stats[event.Id()].stat.UpdateStat(event.DurationPs());
       DCHECK(event_stack.empty() || !(event < event_stack.back()));
       while (!event_stack.empty() &&
@@ -556,34 +579,34 @@ void AggregateXPlane(const XPlane& full_trace, XPlane& aggregated_trace) {
           GetStatTypeStr(StatType::kTotalProfileDurationPs)),
       total_time_ps);
 
-  // TODO(b/238349654): Remove when XPlane better XPlane Comparison mechanism
-  // exists.
-  aggregated_plane.GetOrCreateStatMetadata(
+  XStatMetadata* kMinDurationPs = aggregated_plane.GetOrCreateStatMetadata(
       GetStatTypeStr(StatType::kMinDurationPs));
-  aggregated_plane.GetOrCreateStatMetadata(
+  XStatMetadata* kSelfDurationPs = aggregated_plane.GetOrCreateStatMetadata(
       GetStatTypeStr(StatType::kSelfDurationPs));
+  XStatMetadata* kGroupId = aggregated_plane.GetOrCreateStatMetadata(
+      GetStatTypeStr(StatType::kGroupId));
 
-  for (const auto& [line_id, stat_by_event] : stats) {
+  for (const auto& [line_id, stats_by_group] : stats) {
     XLineBuilder aggregated_line = aggregated_plane.GetOrCreateLine(line_id);
-    for (const auto& [event_id, event_stat] : stat_by_event) {
-      XEventMetadata& event_metadata =
-          *aggregated_plane.GetOrCreateEventMetadata(event_id);
-      CopyEventMetadata(*plane.GetEventMetadata(event_id), plane,
-                        event_metadata, aggregated_plane);
-      XEventBuilder aggregated_event = aggregated_line.AddEvent(event_metadata);
-      aggregated_event.SetNumOccurrences(event_stat.stat.count());
-      aggregated_event.SetDurationPs(event_stat.stat.sum());
-      if (event_stat.stat.count() > 1) {
-        aggregated_event.AddStatValue(
-            *aggregated_plane.GetOrCreateStatMetadata(
-                GetStatTypeStr(StatType::kMinDurationPs)),
-            event_stat.stat.min());
-      }
-      if (event_stat.children_duration != 0) {
-        aggregated_event.AddStatValue(
-            *aggregated_plane.GetOrCreateStatMetadata(
-                GetStatTypeStr(StatType::kSelfDurationPs)),
-            event_stat.stat.sum() - event_stat.children_duration);
+    for (const auto& [group_id, stat_by_event] : stats_by_group) {
+      for (const auto& [event_id, event_stat] : stat_by_event) {
+        XEventMetadata& event_metadata =
+            *aggregated_plane.GetOrCreateEventMetadata(event_id);
+        CopyEventMetadata(*plane.GetEventMetadata(event_id), plane,
+                          event_metadata, aggregated_plane);
+        XEventBuilder aggregated_event =
+            aggregated_line.AddEvent(event_metadata);
+        aggregated_event.SetNumOccurrences(event_stat.stat.count());
+        aggregated_event.SetDurationPs(event_stat.stat.sum());
+        aggregated_event.AddStatValue(*kGroupId, group_id);
+        if (event_stat.stat.count() > 1) {
+          aggregated_event.AddStatValue(*kMinDurationPs, event_stat.stat.min());
+        }
+        if (event_stat.children_duration != 0) {
+          aggregated_event.AddStatValue(
+              *kSelfDurationPs,
+              event_stat.stat.sum() - event_stat.children_duration);
+        }
       }
     }
   }
